@@ -1,213 +1,118 @@
-# Omni-Rvoer
-The code for omni rover 
- // Autonomous Omni-Directional Rover Control System with IMU, Color Sensor, 
-   and Ultrasonic integration 
-// Includes Position Tracking, Heading Estimation, and Motor Dynamics Control Model
+// Motor 1 (L298N #1)
+#define M1_IN1 4
+#define M1_IN2 5
+#define M1_ENA 6
 
-#include <cmath>
-#include <complex>
-using std::complex;
+// Motor 2 (L298N #1)
+#define M2_IN1 7
+#define M2_IN2 8
+#define M2_ENB 9
 
-struct Vector3 {
-    float x;   // forward velocity (m/s)
-    float y;   // lateral velocity (m/s)
-    float wz;  // angular velocity (rad/s)
-};
+// Motor 3 (L298N #2)
+#define M3_IN1 10
+#define M3_IN2 11
+#define M3_ENA 12
 
-// Physical and Electrical Constants
-const float R = 0.05;             // Wheel radius (meters)
-const float Kb = 0.01;            // Back EMF constant
-const float L = 0.2;              // Robot length (meters)
-const float W = 0.2;              // Robot width (meters)
-const float Kp = 1.0;             // Proportional control gain
-const float inductance = 0.01;    // Motor inductance (H)
-const float resistance = 1.0;     // Motor resistance (Ohms)
-const float dt = 0.05;            // Loop time step (seconds)
-const float spikeThreshold = 20.0; // Ultrasonic noise filter threshold (cm)
-const float OBSTACLE_THRESHOLD = 25.0; // Distance to trigger avoidance (cm)
+// Motor 4 (L298N #2)
+#define M4_IN1 13
+#define M4_IN2 14
+#define M4_ENB 15
 
-// Sensor Inputs
-float ultrasonicDistance[4];         // Ultrasonic 
-distances [Front, Right, Back, Left] (cm)
-float lastUltrasonicDistance[4] = {0, 0, 0, 0};
-float filteredSpeed[4] = {0, 0, 0, 0};
-bool ultrasonicValid[4] = {false, false, false, false};
+// URM09 Analog Pins
+#define FRONT_SIG A0
+#define REAR_SIG  A1
 
-float gyroZ;         // Gyro Z-axis rate (rad/s)
-float headingDeg = 0.0f; // Integrated heading (degrees)
-float accX, accY, accZ; // Optional accelerometer data
+// URM09 analog: 0.3V–2.5V → 10–80 cm
+const float analog_min_v = 0.3;
+const float analog_max_v = 2.5;
+const float dist_min_cm = 10;
+const float dist_max_cm = 80;
 
-// Color Sensor Inputs
-int colorSensorLeft;
-int colorSensorRight;
+const int analog_res = 1023;
+const float ref_voltage = 5.0;
 
-// Motor Control Inputs
-float e[4];       // Voltage control error for each motor
-float v[4];       // Reference/control voltage
-float di_dt[4];   // Derivative of motor current
-float ia[4];      // Armature current
+// Threshold distance
+const float trigger_cm = 15;
 
-// Grid Position Tracking (complex plane)
-int realAxis = 0;     // Horizontal (real) position
-int imagAxis = 0;     // Vertical (imaginary) position
-int prevColorLeft = 0, prevColorRight = 0;
-complex<float> targetPosition(5, 3); // Grid coordinate goal
+void setup() {
+  Serial.begin(9600);
 
-// Update heading angle from IMU gyro
-void updateIMUHeading() {
-    headingDeg += gyroZ * dt * 180.0f / M_PI;
-    if (headingDeg > 180.0f) headingDeg -= 360.0f;
-    if (headingDeg < -180.0f) headingDeg += 360.0f;
+  // Motor pins
+  int pins[] = {
+    M1_IN1, M1_IN2, M1_ENA,
+    M2_IN1, M2_IN2, M2_ENB,
+    M3_IN1, M3_IN2, M3_ENA,
+    M4_IN1, M4_IN2, M4_ENB
+  };
+  for (int i = 0; i < 12; i++) pinMode(pins[i], OUTPUT);
+
+  // Sensor pins
+  pinMode(FRONT_SIG, INPUT);
+  pinMode(REAR_SIG, INPUT);
+
+  Serial.println("Front(cm)\tRear(cm)");
 }
 
-// Compute angle from current position to target (degrees)
-float computeAngleToTarget() {
-    complex<float> currentPosition(realAxis, imagAxis);
-    complex<float> toTarget = targetPosition - currentPosition;
-    return atan2(toTarget.imag(), toTarget.real()) * 180.0f / M_PI;
+void loop() {
+  float front_cm = readURM09Analog(FRONT_SIG);
+  float rear_cm  = readURM09Analog(REAR_SIG);
+
+  // Serial Plotter output
+  Serial.print(front_cm);
+  Serial.print("\t");
+  Serial.println(rear_cm);
+
+  if (front_cm > 0 && front_cm < trigger_cm) {
+    moveBackward();
+  } else if (rear_cm > 0 && rear_cm < trigger_cm) {
+    moveForward();
+  } else {
+    stopMotors();
+  }
+
+  delay(100);
 }
 
-// Calculate signed heading difference (target - current)
-float computeHeadingError() {
-    float targetAngle = computeAngleToTarget();
-    float diff = targetAngle - headingDeg;
-    while (diff > 180.0f) diff -= 360.0f;
-    while (diff < -180.0f) diff += 360.0f;
-    return diff;
+// === Read analog voltage and convert to cm ===
+float readURM09Analog(int pin) {
+  int raw = analogRead(pin);
+  float volts = raw * ref_voltage / analog_res;
+
+  if (volts < analog_min_v || volts > analog_max_v) return -1;
+
+  // Map voltage to distance range
+  return mapFloat(volts, analog_min_v, analog_max_v, dist_min_cm, dist_max_cm);
 }
 
-// Compute body velocity using motor dynamics control equation
-Vector3 computeBodyVelocity() {
-    float input[4];
-    for (int i = 0; i < 4; ++i) {
-        input[i] = Kp * e[i] + v[i] - inductance * di_dt[i] - resistance * ia[i];
-    }
-    float factor = R / (4.0f * Kb);
-    float LplusW = L + W;
-
-    Vector3 result;
-    result.x = factor * (input[0] + input[1] + input[2] + input[3]);
-    result.y = factor * (input[0] - input[1] - input[2] + input[3]);
-    result.wz = factor * (-input[0] + input[1] - input[2] + input[3]) / LplusW;
-    return result;
+// === Float map like Arduino's map() ===
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-// Update grid position from color sensor transitions
-void updatePositionFromColorSensors(int leftColor, int rightColor) {
-    if (prevColorLeft == 2 && leftColor == 1) imagAxis++;
-    else if (prevColorLeft == 1 && leftColor == 2) imagAxis--;
-    if (prevColorRight == 3 && rightColor == 1) realAxis++;
-    else if (prevColorRight == 1 && rightColor == 3) realAxis--;
-    if ((prevColorLeft == 3 && prevColorRight == 2) && (leftColor == 4 && rightColor == 4)) {
-        realAxis++; imagAxis++;
-    }
-    if ((prevColorLeft == 1 && prevColorRight == 1) && (leftColor == 4 && rightColor == 4)) {
-        realAxis--; imagAxis--;
-    }
-    prevColorLeft = leftColor;
-    prevColorRight = rightColor;
+// === Motor control ===
+void moveForward() {
+  setMotor(M1_IN1, M1_IN2, M1_ENA, true);
+  setMotor(M2_IN1, M2_IN2, M2_ENB, true);
+  setMotor(M3_IN1, M3_IN2, M3_ENA, true);
+  setMotor(M4_IN1, M4_IN2, M4_ENB, true);
 }
 
-// Check if robot has reached the target
-bool isAtTarget() {
-    return realAxis == static_cast<int>(targetPosition.real()) &&
-           imagAxis == static_cast<int>(targetPosition.imag());
+void moveBackward() {
+  setMotor(M1_IN1, M1_IN2, M1_ENA, false);
+  setMotor(M2_IN1, M2_IN2, M2_ENB, false);
+  setMotor(M3_IN1, M3_IN2, M3_ENA, false);
+  setMotor(M4_IN1, M4_IN2, M4_ENB, false);
 }
 
-// Motion Types for Omni Rover
-enum MotionType {
-    FORWARD, BACKWARD, LEFT, RIGHT, ROTATE_CW, ROTATE_CCW,
-    FORWARD_LEFT, FORWARD_RIGHT, BACKWARD_LEFT, BACKWARD_RIGHT
-};
-
-// Speed Profile
-enum SpeedClass { SLOW, FAST };
-
-// Obstacle Avoidance FSM
-enum AvoidanceState {
-    NORMAL, AVOID_LEFT, AVOID_BACK,
-    WAITING_LEFT_CLEAR, WAITING_BACK_CLEAR
-};
-
-AvoidanceState avoidanceState = NORMAL;
-
-// Get motor reference voltages for a given motion type and speed
-void getReferenceVoltages(MotionType motion, SpeedClass speed, float vRef[4]) {
-    float base = (speed == FAST) ? 10.0f : 5.0f;
-    switch (motion) {
-        case FORWARD: vRef[0] = vRef[1] = vRef[2] = vRef[3] = base; break;
-        case BACKWARD: vRef[0] = vRef[1] = vRef[2] = vRef[3] = -base; break;
-        case LEFT: vRef[0] = base; vRef[1] = -base; vRef[2] = -base; vRef[3] = base; break;
-        case RIGHT: vRef[0] = -base; vRef[1] = base; vRef[2] = base; vRef[3] = -base; break;
-        case ROTATE_CW: vRef[0] = -base; vRef[1] = base; vRef[2] = -base; vRef[3] = base; break;
-        case ROTATE_CCW: vRef[0] = base; vRef[1] = -base; vRef[2] = base; vRef[3] = -base; break;
-        case FORWARD_LEFT: vRef[0] = base; vRef[1] = 0; vRef[2] = 0; vRef[3] = base; break;
-        case FORWARD_RIGHT: vRef[0] = 0; vRef[1] = base; vRef[2] = base; vRef[3] = 0; break;
-        case BACKWARD_LEFT: vRef[0] = -base; vRef[1] = 0; vRef[2] = 0; vRef[3] = -base; break;
-        case BACKWARD_RIGHT: vRef[0] = 0; vRef[1] = -base; vRef[2] = -base; vRef[3] = 0; break;
-    }
+void stopMotors() {
+  analogWrite(M1_ENA, 0);
+  analogWrite(M2_ENB, 0);
+  analogWrite(M3_ENA, 0);
+  analogWrite(M4_ENB, 0);
 }
 
-// Obstacle Avoidance Logic using Finite State Machine
-void handleObstacleAvoidance() {
-    updateIMUHeading();
-    updatePositionFromColorSensors(colorSensorLeft, colorSensorRight);
-
-    if (isAtTarget()) {
-        for (int i = 0; i < 4; i++) v[i] = 0; // Stop motors
-        return;
-    }
-
-    switch (avoidanceState) {
-        case NORMAL:
-            if (ultrasonicDistance[0] < OBSTACLE_THRESHOLD && ultrasonicValid[0]) {
-                getReferenceVoltages(ROTATE_CCW, SLOW, v);
-                avoidanceState = AVOID_LEFT;
-            } else {
-                float error = computeHeadingError();
-                if (fabs(error) > 5) getReferenceVoltages(ROTATE_CCW, SLOW, v);
-                else getReferenceVoltages(FORWARD, FAST, v);
-            }
-            break;
-
-        case AVOID_LEFT:
-            if (ultrasonicDistance[3] >= OBSTACLE_THRESHOLD && ultrasonicValid[3]) {
-                getReferenceVoltages(FORWARD, SLOW, v);
-                avoidanceState = WAITING_LEFT_CLEAR;
-            } else {
-                getReferenceVoltages(ROTATE_CCW, SLOW, v);
-                avoidanceState = AVOID_BACK;
-            }
-            break;
-
-        case AVOID_BACK:
-            if (ultrasonicDistance[2] >= OBSTACLE_THRESHOLD && ultrasonicValid[2]) {
-                getReferenceVoltages(FORWARD, SLOW, v);
-                avoidanceState = WAITING_BACK_CLEAR;
-            }
-            break;
-
-        case WAITING_LEFT_CLEAR:
-            if (ultrasonicDistance[3] >= OBSTACLE_THRESHOLD &&
-                ultrasonicDistance[0] >= OBSTACLE_THRESHOLD) {
-                float error = computeHeadingError();
-                if (fabs(error) > 5) getReferenceVoltages(ROTATE_CW, SLOW, v);
-                else {
-                    getReferenceVoltages(FORWARD, FAST, v);
-                    avoidanceState = NORMAL;
-                }
-            }
-            break;
-
-        case WAITING_BACK_CLEAR:
-            if (ultrasonicDistance[3] >= OBSTACLE_THRESHOLD) {
-                float error = computeHeadingError();
-                if (fabs(error) > 5) getReferenceVoltages(ROTATE_CCW, SLOW, v);
-                else {
-                    getReferenceVoltages(FORWARD, FAST, v);
-                    avoidanceState = NORMAL;
-                }
-            }
-            break;
-    }
+void setMotor(int in1, int in2, int en, bool forward) {
+  digitalWrite(in1, forward ? HIGH : LOW);
+  digitalWrite(in2, forward ? LOW : HIGH);
+  analogWrite(en, 255);
 }
